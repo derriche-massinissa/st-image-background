@@ -1,0 +1,221 @@
+diff --git a/config.mk b/config.mk
+index c070a4a..472a124 100644
+--- a/config.mk
++++ b/config.mk
+@@ -16,7 +16,7 @@ PKG_CONFIG = pkg-config
+ INCS = -I$(X11INC) \
+        `$(PKG_CONFIG) --cflags fontconfig` \
+        `$(PKG_CONFIG) --cflags freetype2`
+-LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft \
++LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft -lIL\
+        `$(PKG_CONFIG) --libs fontconfig` \
+        `$(PKG_CONFIG) --libs freetype2`
+ 
+diff --git a/x.c b/x.c
+index 210f184..3ddac92 100644
+--- a/x.c
++++ b/x.c
+@@ -15,6 +15,9 @@
+ #include <X11/Xft/Xft.h>
+ #include <X11/XKBlib.h>
+ 
++/* including the devil image library */
++#include <IL/il.h>
++
+ char *argv0;
+ #include "arg.h"
+ #include "st.h"
+@@ -107,6 +110,11 @@ typedef struct {
+ 	int isfixed; /* is fixed geometry? */
+ 	int l, t; /* left and top offset */
+ 	int gm; /* geometry mask */
++	/* background image properties */
++	Pixmap bgpm;
++	Pixmap areapm;
++	unsigned int realX, realY, imgW, imgH;
++	int alreadyLoaded;
+ } XWindow;
+ 
+ typedef struct {
+@@ -189,6 +197,11 @@ static int match(uint, uint);
+ static void run(void);
+ static void usage(void);
+ 
++/* Load background image */
++static void loadBgImage(void);
++/* Changing background position */
++static void updateBg(void);
++
+ static void (*handler[LASTEvent])(XEvent *) = {
+ 	[KeyPress] = kpress,
+ 	[ClientMessage] = cmessage,
+@@ -732,11 +745,8 @@ xresize(int col, int row)
+ 	win.tw = col * win.cw;
+ 	win.th = row * win.ch;
+ 
+-	XFreePixmap(xw.dpy, xw.buf);
+-	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
+-			DefaultDepth(xw.dpy, xw.scr));
+-	XftDrawChange(xw.draw, xw.buf);
+-	xclear(0, 0, win.w, win.h);
++	XClearWindow(xw.dpy, xw.win);
++	XftDrawChange(xw.draw, xw.win);
+ 
+ 	/* resize to new width */
+ 	xw.specbuf = xrealloc(xw.specbuf, col * sizeof(GlyphFontSpec));
+@@ -820,9 +830,7 @@ xsetcolorname(int x, const char *name)
+ void
+ xclear(int x1, int y1, int x2, int y2)
+ {
+-	XftDrawRect(xw.draw,
+-			&dc.col[IS_SET(MODE_REVERSE)? defaultfg : defaultbg],
+-			x1, y1, x2-x1, y2-y1);
++	XClearArea(xw.dpy, xw.win, x1, y1, x2-x1, y2-y1, False);
+ }
+ 
+ void
+@@ -1148,16 +1156,16 @@ xinit(int cols, int rows)
+ 	gcvalues.graphics_exposures = False;
+ 	dc.gc = XCreateGC(xw.dpy, parent, GCGraphicsExposures,
+ 			&gcvalues);
+-	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
+-			DefaultDepth(xw.dpy, xw.scr));
+-	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
+-	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
++
++	/* Load background image into the window's pixmap */
++	xw.alreadyLoaded = 0; // Background pixmaps not created yet
++	loadBgImage();
+ 
+ 	/* font spec buffer */
+ 	xw.specbuf = xmalloc(cols * sizeof(GlyphFontSpec));
+ 
+ 	/* Xft rendering context */
+-	xw.draw = XftDrawCreate(xw.dpy, xw.buf, xw.vis, xw.cmap);
++	xw.draw = XftDrawCreate(xw.dpy, xw.win, xw.vis, xw.cmap);
+ 
+ 	/* input methods */
+ 	if (!ximopen(xw.dpy)) {
+@@ -1447,7 +1455,12 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
+ 		xclear(winx, winy + win.ch, winx + width, win.h);
+ 
+ 	/* Clean up the region we want to draw to. */
+-	XftDrawRect(xw.draw, bg, winx, winy, width, win.ch);
++	if (bg == &dc.col[defaultbg]) { // Clean up past glyphs
++		XClearArea(xw.dpy, xw.win, winx, winy, width, win.ch, False);
++	}
++	else { // Draw cursor
++		XftDrawRect(xw.draw, bg, winx, winy, width, win.ch);
++	}
+ 
+ 	/* Set the clip region because Xft is sometimes dirty. */
+ 	r.x = 0;
+@@ -1632,8 +1645,7 @@ xdrawline(Line line, int x1, int y1, int x2)
+ void
+ xfinishdraw(void)
+ {
+-	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w,
+-			win.h, 0, 0);
++	XftDrawChange(xw.draw, xw.win);
+ 	XSetForeground(xw.dpy, dc.gc,
+ 			dc.col[IS_SET(MODE_REVERSE)?
+ 				defaultfg : defaultbg].pixel);
+@@ -1850,11 +1862,21 @@ cmessage(XEvent *e)
+ 		ttyhangup();
+ 		exit(0);
+ 	}
++
++	// Handle new background event emitted by script
++	const char* eventName = "_NEW_BG";
++	Atom dump;
++	if (e->xclient.message_type == XInternAtoms(xw.dpy, (char**) &eventName, 1, False, &dump)) {
++		loadBgImage();
++	}
+ }
+ 
+ void
+ resize(XEvent *e)
+ {
++	if (e->xconfigure.x != xw.realX || e->xconfigure.y != xw.realY)
++		updateBg();
++
+ 	if (e->xconfigure.width == win.w && e->xconfigure.height == win.h)
+ 		return;
+ 
+@@ -1977,6 +1999,76 @@ usage(void)
+ 	    " [stty_args ...]\n", argv0, argv0);
+ }
+ 
++/* Load background image */
++void
++loadBgImage(void)
++{
++	Window parent;
++        parent = XRootWindow(xw.dpy, xw.scr);
++	xw.realX = 0;
++	xw.realY = 0;
++
++	/* Load background image to use */
++	// Some temporary variables
++	unsigned int scrW, scrH;
++	Screen *screen;
++	screen = ScreenOfDisplay( xw.dpy, xw.scr );
++	scrW = XWidthOfScreen( screen );
++	scrH = XHeightOfScreen( screen );
++	// Pixmaps
++        if (xw.alreadyLoaded) {
++            XFreePixmap(xw.dpy, xw.bgpm);
++            XFreePixmap(xw.dpy, xw.areapm);
++        } else xw.alreadyLoaded = 1;
++	xw.bgpm = XCreatePixmap( xw.dpy, parent, scrW, scrH, XDefaultDepth(xw.dpy,xw.scr) );
++	xw.areapm = XCreatePixmap( xw.dpy, parent, scrW, scrH, XDefaultDepth(xw.dpy,xw.scr) );
++	// Load image (DevIL)
++	chdir( getenv("HOME") );
++	ilInit();
++	ILuint bgILName;
++	ilGenImages( 1,&bgILName );
++	ilBindImage( bgILName );
++	ILboolean loadImgIL;
++	loadImgIL = ilLoadImage( ".config/wall0" );
++	if( loadImgIL == IL_TRUE )
++	{
++		ILuint imgWIL = ilGetInteger( IL_IMAGE_WIDTH );
++		ILuint imgHIL = ilGetInteger( IL_IMAGE_HEIGHT );
++		xw.imgW = (int)imgWIL;
++		xw.imgH = (int)imgHIL;
++		unsigned char *imgData = (unsigned char *)malloc(xw.imgW*xw.imgH*4);
++		ilCopyPixels( 0, 0, 0, xw.imgW, xw.imgH, 1, IL_BGRA, IL_UNSIGNED_BYTE, imgData );
++		ilDeleteImages( 1,&bgILName );
++		XImage *imgBg = XCreateImage( xw.dpy, xw.vis, XDefaultDepth(xw.dpy,xw.scr), ZPixmap, 0, imgData, xw.imgW, xw.imgH, 32, 0 );
++		XPutImage( xw.dpy, xw.bgpm, dc.gc, imgBg, 0, 0, 0, 0, xw.imgW, xw.imgH );
++		XDestroyImage( imgBg );
++	}
++	else
++	{
++		xw.imgW = scrW;
++		xw.imgH = scrH;
++                XSetForeground( xw.dpy, dc.gc, dc.col[defaultbg].pixel );
++		XFillRectangle( xw.dpy, xw.bgpm, dc.gc, 0, 0, scrW, scrH );
++	}
++
++	/* Update background*/
++	XSetWindowBackgroundPixmap( xw.dpy, xw.win, xw.areapm );
++	updateBg();
++}
++
++/* Changing background position */
++void
++updateBg(void)
++{
++	Window tmpW;
++	XTranslateCoordinates( xw.dpy, xw.win, XRootWindow(xw.dpy, xw.scr), 0, 0, &xw.realX, &xw.realY, &tmpW );
++	int copyAreaW = xw.imgW - xw.realX;
++	int copyAreaH = xw.imgH - xw.realY;
++	XCopyArea( xw.dpy, xw.bgpm, xw.areapm, dc.gc, xw.realX, xw.realY, copyAreaW, copyAreaH, 0, 0 );
++	XClearWindow( xw.dpy, xw.win );
++	redraw(); //Borrowing an st function to rewrite the text
++}
++
+ int
+ main(int argc, char *argv[])
+ {
